@@ -1,5 +1,5 @@
 """EDMC_Exiles: The Exiles' own plugin for EDMC, beside BGS Tally. These are EDMC's entry points; everything else
-lives in exiles/ (core, sender, status, state, pairing, updater, words, ui). See README.md at the repo root.
+lives in exiles/ (core, sender, journal, status, state, pairing, updater, words, ui). See README.md at the repo root.
 
 There is no plugin_prefs: the plugin asks EDMC for no tab in its Settings dialog (0.2.6). Two settings pages were one
 too many, and a box a pilot can type in is a way to break the plugin. The one settings page is the Exiles window's,
@@ -68,11 +68,27 @@ def _user_agent() -> str:
     return f"{base} {PLUGIN_NAME}/{VERSION}".strip()
 
 
+def _journal_dir():
+    """The folder the game writes its journal in: the one EDMC is set to read, else the game's usual one. Asked each
+    time it is needed, so a change made in EDMC's settings is followed. None when neither is a folder."""
+    for ask in (lambda: config.get_str("journaldir"), lambda: config.default_journal_dir):
+        try:
+            folder = ask()
+        except Exception:
+            continue
+        if folder and str(folder) != "None":
+            path = Path(str(folder)).expanduser()
+            if path.is_dir():
+                return path
+    return None
+
+
 def plugin_start3(plugin_dir: str) -> str:
     session = new_session() if callable(new_session) else None
     this.core = ExilesPlugin(plugin_dir=Path(plugin_dir), settings=Settings(config), http=make_http(_user_agent(), session),
                              game_running=_game_running, log=logger, version=VERSION, edmc_version=_edmc_version(),
-                             download=make_download(_user_agent(), session))
+                             download=make_download(_user_agent(), session),
+                             journal_dir=_journal_dir if config is not None else None)
     this.core.start()
     # The whole package is loaded now, never piece by piece later. EDMC runs for days, and a newer version copied over
     # it would otherwise be imported half and half the first time a part of it is needed: new code on old words.

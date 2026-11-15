@@ -11,12 +11,14 @@ import re
 import secrets
 import threading
 import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import urlencode
 
 from . import updater
+from .journal import READ_FROM_FILE, READ_KEY, JournalReader, epoch
 from .pairing import Pairing
 from .sender import Sender
 from .state import StateTracker
@@ -53,6 +55,13 @@ INSTALL_ID = re.compile(r"^[a-z0-9]{8,32}$")
 # keeps none of them, so sending them only put private words on the wire; they were about half of all the lines a
 # day of play writes.
 NEVER_SENT = frozenset({"ReceiveText", "SendText", "Friends", "Music"})
+# The plugin reads the journal file itself as well (journal.py, 0.7.1), so a line EDMC does not hand over still goes.
+# While the sender holds BACKLOG_MOST entries that read waits. With no journal entry from EDMC for EDMC_QUIET seconds,
+# what the plugin read itself says who is flying and where. WHERES_KEPT Status positions are kept, to place a line
+# that was read from the file by the position of its own moment.
+BACKLOG_MOST = 2000
+EDMC_QUIET = 30.0
+WHERES_KEPT = 600
 
 
 def utc_now_iso() -> str:
@@ -102,9 +111,12 @@ class Settings:
 class ExilesPlugin:
     def __init__(self, *, plugin_dir: Path, settings: Settings, http: Callable[..., tuple], game_running: Callable[[], bool],
                  log: logging.Logger, version: str, edmc_version: str = "", clock: Callable[[], float] = time.monotonic,
-                 download: Optional[Callable[..., tuple]] = None):
+                 download: Optional[Callable[..., tuple]] = None,
+                 journal_dir: Optional[Callable[[], Optional[Path]]] = None):
         """http(method, url, body=None, headers=None, timeout=20) -> (status_code, parsed_json_or_None).
-        download(url, limit, timeout=60, headers=None) -> (status_code, bytes or None), for a new version's zip (0.6.0)."""
+        download(url, limit, timeout=60, headers=None) -> (status_code, bytes or None), for a new version's zip (0.6.0).
+        journal_dir() -> the folder the game writes its journal in, or None (0.7.1); without it the plugin reads no
+        file itself and has only what EDMC hands over."""
         self.plugin_dir = Path(plugin_dir)
         self.settings = settings
         self.http = http
@@ -151,6 +163,14 @@ class ExilesPlugin:
         self._beat_at: Optional[float] = None         # the clock at the last heartbeat queued
         self._beat_running: Optional[bool] = None     # what it said of the game
         self._feed_thread: Optional[threading.Thread] = None
+        self._edmc_at: Optional[float] = None         # the clock when EDMC last handed a journal entry over
+        self._wheres: deque = deque(maxlen=WHERES_KEPT)   # (the time on a Status entry, the position it carried)
+        self.journal: Optional[JournalReader] = None
+        if journal_dir is not None:
+            self.journal = JournalReader(folder=journal_dir, recover=self._recovered, status=self._status_from_file,
+                                         picture=self._picture_from_file, active=lambda: self.paired,
+                                         room=lambda: self.sender.waiting() < BACKLOG_MOST,
+                                         keep_dir=self.plugin_dir / "spool", log=log, never=NEVER_SENT, clock=clock)
 
     # ----- lifecycle ------------------------------------------------------------------------------------------------
     @property
@@ -188,6 +208,8 @@ class ExilesPlugin:
         self._beat_thread.start()
         self._feed_thread = threading.Thread(target=self._feed_loop, name="EDMC_Exiles feed", daemon=True)
         self._feed_thread.start()
+        if self.journal:
+            self.journal.start()
 
     def stop(self) -> None:
         """EDMC is closing: a last word to EXDB (the game may still run, so only `closing`), then the sender winds up."""
@@ -200,6 +222,8 @@ class ExilesPlugin:
                 self._post_exdb("/plugin/heartbeat", self.heartbeat_body(closing=True), timeout=3)
             except Exception as e:
                 self.log.info(f"closing heartbeat not sent: {e.__class__.__name__}")
+        if self.journal:
+            self.journal.stop()       # before the sender: what it still held goes out with the rest
         self.sender.stop()
 
     # ----- EDMC's hooks ---------------------------------------------------------------------------------------------
@@ -207,6 +231,9 @@ class ExilesPlugin:
                       state: dict) -> None:
         if is_beta or not isinstance(entry, dict):
             return
+        self._edmc_at = self._clock()
+        if self.journal:
+            self.journal.handed(entry)
         if cmdr:
             self.cmdr = cmdr
             self.sender.cmdr = cmdr
@@ -259,10 +286,78 @@ class ExilesPlugin:
     def dashboard_entry(self, cmdr: Optional[str], is_beta: bool, entry: dict) -> None:
         if is_beta or not isinstance(entry, dict):
             return
+        if self.journal:
+            self.journal.status_handed(entry)
+        self._status_entry(entry)
+
+    def _status_entry(self, entry: dict) -> None:
+        """A Status entry, from EDMC or read from the file by the plugin itself: kept as the latest, its position
+        noted, and sent when it is worth sending."""
         self.last_status, self._status_at = entry, self._clock()
+        where, at = where_from_status(entry), epoch(entry.get("timestamp"))
+        if where and at is not None:
+            self._wheres.append((at, where))
         if self.paired and self.throttle.worth(entry):
             self.sender.add("/plugin/status", {"at": entry.get("timestamp") or utc_now_iso(), "status": dict(entry)}, replace_key="status")
         self._from_worker("status", status_words(entry))
+
+    # ----- what the plugin reads from the game's files itself (journal.py, 0.7.1) ------------------------------------
+    def where_at(self, stamp: Any) -> Optional[dict]:
+        """Where the pilot was at a journal time: the Status position nearest to it, at most WHERE_FRESH away."""
+        at = epoch(stamp)
+        if at is None:
+            return None
+        best = None
+        for t, where in tuple(self._wheres):
+            gap = abs(t - at)
+            if gap <= WHERE_FRESH and (best is None or gap < best[0]):
+                best = (gap, where)
+        return best[1] if best else None
+
+    def _recovered(self, entry: dict, cmdr: Optional[str], live: bool) -> None:
+        """A journal line EDMC did not hand over, read from the file by the plugin itself. It goes out as the game
+        wrote it, for the commander the file names, marked as read from the file (READ_KEY); a kind the database
+        places by position carries the position of its own moment as well."""
+        if not self.paired or entry.get("event") in NEVER_SENT:
+            return
+        event = dict(entry)
+        event[READ_KEY] = READ_FROM_FILE
+        if entry.get("event") in STAMPED:
+            where = self.where_at(entry.get("timestamp"))
+            if where:
+                event[WHERE_KEY] = where
+        self.sender.add_event(event, cmdr or self.cmdr)
+        self._from_worker("entry", entry.get("event"))
+
+    def _status_from_file(self, entry: dict) -> None:
+        """A Status entry EDMC did not hand over, read from the Status file by the plugin itself."""
+        if isinstance(entry, dict):
+            self._status_entry(entry)
+
+    def _picture_from_file(self, seen: dict) -> None:
+        """What the journal last said, as the plugin read it itself: who is flying, where, and whether a session is
+        on. It stands in only while EDMC hands no journal entry over, as in a run where EDMC reads no journal at all;
+        with EDMC talking, EDMC's word is the one kept."""
+        if self._edmc_at is not None and self._clock() - self._edmc_at < EDMC_QUIET:
+            return
+        if seen.get("cmdr"):
+            self.cmdr = seen["cmdr"]
+            self.sender.cmdr = seen["cmdr"]
+        if seen.get("system"):
+            self.system = seen["system"]
+        if seen.get("docked") is not None:
+            self.docked = bool(seen["docked"])
+            self.station = seen.get("station")
+        for k in ("version", "build", "odyssey"):
+            if seen.get(k) is not None:
+                self.game[k] = seen[k]
+        session = seen.get("session")
+        if session is not None and session != self.in_session:
+            self.in_session = bool(session)
+            self.send_heartbeat(running=bool(session))
+            if not session:
+                self.throttle.reset()
+        self._from_worker("entry", None)
 
     # ----- the heartbeat --------------------------------------------------------------------------------------------
     def in_game(self) -> bool:

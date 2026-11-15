@@ -64,7 +64,8 @@ Playing on two PCs? Install and pair it on both. Each PC gets its own key, and t
 There are no switches. Once paired, the plugin sends:
 
 - **Your journal**, as the game writes it: jumps, dockings, missions, bounties, bonds, trades, scans and the
-  rest.
+  rest. EDMC hands it to the plugin, and the plugin reads the journal file itself as well, so a line EDMC does
+  not hand over still arrives.
 - **Your status** while the game runs: where you are, your fuel, and whether you are docked, landed, in
   supercruise or on foot.
 - **What EDMC knows about your commander**: cargo, materials, ship locker, ship and suit loadout, ranks,
@@ -109,6 +110,7 @@ you ever share EDMC's `config.toml` file, your key is in it, so do not post that
 | `EDMC_Exiles/load.py` | EDMC's entry points |
 | `EDMC_Exiles/exiles/core.py` | the hooks, the heartbeat, pairing and the read of the site's feed |
 | `EDMC_Exiles/exiles/sender.py` | one worker thread that sends everything: batches, retries, and a spool on disk while offline |
+| `EDMC_Exiles/exiles/journal.py` | the plugin's own read of the journal and Status files, for what EDMC does not hand over |
 | `EDMC_Exiles/exiles/pairing.py` | pairing by code |
 | `EDMC_Exiles/exiles/updater.py` | updates: checks a new version's signature and puts it in place |
 | `EDMC_Exiles/exiles/status.py` | which Status entries are worth sending |

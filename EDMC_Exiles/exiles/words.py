@@ -623,6 +623,20 @@ def unpair_words(core) -> Optional[str]:
 DETAILS_NOTE = "For when a leader asks what the plugin is doing. No key is in it."
 
 
+def journal_words(core) -> list:
+    """What the plugin read from the game's files itself since EDMC started (0.7.1), as one line for the details; no
+    line where it reads none."""
+    j = getattr(core, "journal", None)
+    if j is None:
+        return []
+    n = j.counts
+    line = (f"Read from the journal file: {n.get('read', 0):,} lines, {n.get('recovered', 0):,} sent that EDMC did not hand over"
+            f" ({n.get('handed', 0):,} it did)")
+    if n.get("status"):
+        line += f". Status read from its file: {n['status']:,}"
+    return [line]
+
+
 def details_words(core, now: Optional[datetime] = None) -> str:
     """The plugin's state as a few plain lines for the clipboard: the versions, how the link stands, what went out
     this session and the last trouble. Never the key, the token or the install's id."""
@@ -643,6 +657,7 @@ def details_words(core, now: Optional[datetime] = None) -> str:
         f"Sent since EDMC started: {c.get('events', 0):,} journal lines in {c.get('batches', 0):,} batches, {c.get('skipped', 0):,} already on file, "
         f"{c.get('status', 0):,} status, {c.get('state', 0):,} state, {c.get('heartbeats', 0):,} heartbeats",
         f"Kept on this PC: {kept} batch{'' if kept == 1 else 'es'}. Set aside: {c.get('refused', 0)}. Errors: {c.get('errors', 0)}",
+        *journal_words(core),
         f"Last trouble: {s.last_error or 'none'}",
         "Site: " + (core.feed_error if core.feed_error else f"read {ago(feed.get('at'), now)}" if feed.get("at") else "not read yet"),
     ]
